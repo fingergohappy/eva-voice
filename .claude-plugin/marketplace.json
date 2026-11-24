@@ -1,0 +1,6 @@
+{
+  "name": "eva-voice",
+  "description": "eva-voice: game voice lines for each stage of a Claude Code session",
+  "owner": { "name": "fingergohappy" },
+  "plugins": [{ "name": "eva-voice", "source": "./" }]
+}

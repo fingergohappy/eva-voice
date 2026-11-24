@@ -1,0 +1,17 @@
+{
+  "name": "eva-voice",
+  "version": "0.2.0",
+  "description": "Plays a game voice line (Red Alert 2, StarCraft, Warcraft III…) at each stage of a Claude Code session; configure with /voices",
+  "author": { "name": "fingergohappy", "url": "https://github.com/fingergohappy" },
+  "homepage": "https://github.com/fingergohappy/eva-voice",
+  "repository": "https://github.com/fingergohappy/eva-voice",
+  "license": "MIT",
+  "icon": "./.claude-plugin/icon.png",
+  "types": "./types/index.d.ts",
+  "network": {
+    "hosts": [
+      "github.com",
+      "raw.githubusercontent.com"
+    ]
+  }
+}
