@@ -42,7 +42,8 @@ function fakeHost(on: On, { installed = ['red-alert-2'] }: { installed?: string[
   })
   on('ui.focus', () => ({}))
   on('fs.stat', (_, e) => {
-    if (!e.path.startsWith('/music/')) throw new Error('ENOENT')
+    // Files under /music/; a value naming several paths at once is not one file.
+    if (!e.path.startsWith('/music/') || / ['"]?\//.test(e.path)) throw new Error('ENOENT')
     return { value: { kind: 'file', size: 1, mtimeMs: 0, isLink: false } }
   })
   on('fs.list', (_, e) => {
@@ -173,5 +174,31 @@ test('the band above the prompt names the pack and its speaker mutes the voice',
   const saved = JSON.parse(written.get('/home/tester/.config/eva-voice/config.json') ?? '{}')
   expect(saved.enabled).toBe(false)
   expect(await ui.find({ type: 'Text', text: /已静音/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('加 adds several dropped files beside the stage\'s own, and ✕ takes one out', async ($, on) => {
+  const { ran, written } = fakeHost(on)
+  const saved = () => JSON.parse(written.get('/home/tester/.config/eva-voice/config.json') ?? '{}')
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+
+  await ui.press({ key: 'swap-done' })
+  await ui.input({ key: 'file', text: '/music/one.wav' })
+  expect(saved().events.done.custom.length).toBe(1)
+
+  // Two files dropped at once: one escaped, one quoted.
+  await ui.press({ key: 'add-done' })
+  await ui.input({ key: 'file', text: "/music/two\\ b.wav '/music/three.wav'" })
+  const custom: string[] = saved().events.done.custom
+  expect(custom.length).toBe(3)
+  expect(ran.some(one => one.argv[0] === 'cp' && one.argv[1] === '/music/two b.wav')).toBe(true)
+  expect(ran.some(one => one.argv[0] === 'cp' && one.argv[1] === '/music/three.wav')).toBe(true)
+
+  await ui.press({ key: 'list-done' })
+  expect(await ui.find({ key: 'hear-done-2' })).toBeDefined()
+  await ui.press({ key: 'rm-done-0' })
+  expect(saved().events.done.custom).toEqual(custom.slice(1))
+  expect(ran.some(one => one.argv[0] === 'rm' && one.argv.includes(custom[0] ?? ''))).toBe(true)
   await ui.unmount()
 })

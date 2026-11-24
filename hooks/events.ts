@@ -107,9 +107,48 @@ export const cleanPath = (raw: string, home: string): string => {
   } else {
     path = path.replace(/\\(.)/g, '$1')
   }
-  if (path.startsWith('file://')) path = decodeURIComponent(path.slice('file://'.length))
-  if (path === '~' || path.startsWith('~/')) path = home + path.slice(1)
-  return path
+  return expandPath(path, home)
+}
+
+/** `~` and `file://` turned into a plain absolute path. */
+export const expandPath = (path: string, home: string): string => {
+  let out = path
+  if (out.startsWith('file://')) out = decodeURIComponent(out.slice('file://'.length))
+  if (out === '~' || out.startsWith('~/')) out = home + out.slice(1)
+  return out
+}
+
+/**
+ * Splits what dropping several files types into the terminal: paths separated by
+ * blanks, each quoted or with its own blanks backslash-escaped.
+ */
+export const splitPaths = (raw: string, home: string): string[] => {
+  const out: string[] = []
+  let cur = ''
+  let quote = ''
+  let isOpen = false
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw.charAt(i)
+    if (quote !== '') {
+      if (ch === quote) quote = ''
+      else cur += ch
+    } else if (ch === '\\' && i + 1 < raw.length) {
+      cur += raw.charAt(++i)
+      isOpen = true
+    } else if (ch === "'" || ch === '"') {
+      quote = ch
+      isOpen = true
+    } else if (/\s/.test(ch)) {
+      if (isOpen) out.push(cur)
+      cur = ''
+      isOpen = false
+    } else {
+      cur += ch
+      isOpen = true
+    }
+  }
+  if (isOpen) out.push(cur)
+  return out.map(one => expandPath(one, home))
 }
 
 export const baseName = (path: string): string => path.slice(path.lastIndexOf('/') + 1)

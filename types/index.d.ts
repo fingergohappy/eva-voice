@@ -35,6 +35,9 @@ export type VoiceConfig = {
   events: Record<VoiceEvent, EventSetting>
 }
 
+/** Which stage's row shows the file field, and whether its files replace the stage's or join them. */
+export type Editing = { stage: VoiceEvent; mode: 'replace' | 'add' }
+
 /** One downloadable pack, as index.json lists it. */
 export type CatalogPack = {
   name: string
@@ -60,7 +63,9 @@ declare module 'claude-code' {
   interface PluginState {
     'eva-voice': {
       config: Shaped<VoiceConfig>
-      editing: Shaped<VoiceEvent | null>
+      editing: Shaped<Editing | null>
+      /** The stage whose clip list is open, or null. */
+      expanded: Shaped<VoiceEvent | null>
       note: Shaped<string>
       greeted: Shaped<boolean>
       /** null until fetched. */

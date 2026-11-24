@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { CatalogPack, EventSetting, VoiceConfig, VoiceEvent } from '../types'
+import type { CatalogPack, Editing, EventSetting, VoiceConfig, VoiceEvent } from '../types'
 import { fetchCatalog, formatSize, installPack, listInstalled, removePack } from './catalog'
 import {
   AUDIO_EXT,
@@ -15,6 +15,7 @@ import {
   isVoiceEvent,
   normalize,
   safeName,
+  splitPaths,
 } from './events'
 
 type $ = EngineInterface
@@ -26,9 +27,12 @@ const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit'])
 const config = atom({ plugin: 'eva-voice', key: 'config' } as const, defaultConfig(), {
   shape: 'config-3',
 })
-/** The stage whose row shows the file field, or null. */
-const editing = atom({ plugin: 'eva-voice', key: 'editing' } as const, null as VoiceEvent | null, {
-  shape: 'editing-1',
+/** The stage whose row shows the file field, and what its files do, or null. */
+const editing = atom({ plugin: 'eva-voice', key: 'editing' } as const, null as Editing | null, {
+  shape: 'editing-2',
+})
+const expanded = atom({ plugin: 'eva-voice', key: 'expanded' } as const, null as VoiceEvent | null, {
+  shape: 'expanded-1',
 })
 const note = atom({ plugin: 'eva-voice', key: 'note' } as const, '', { shape: 'note-1' })
 const greeted = atom({ plugin: 'eva-voice', key: 'greeted' } as const, false, {
@@ -203,8 +207,16 @@ async function playFile($: $, file: string, volume: number): Promise<boolean> {
   }
 }
 
-const pickOne = (list: readonly string[]): string | undefined =>
-  list[Math.floor(Math.random() * list.length)]
+const lastClip = new Map<VoiceEvent, string>()
+
+/** A random clip of the stage's, never the one it played last time when it has others. */
+function pickOne(list: readonly string[], key?: VoiceEvent): string | undefined {
+  const last = key === undefined ? undefined : lastClip.get(key)
+  const pool = list.length > 1 && last !== undefined ? list.filter(one => one !== last) : list
+  const file = pool[Math.floor(Math.random() * pool.length)]
+  if (key !== undefined && file !== undefined) lastClip.set(key, file)
+  return file
+}
 
 /** Plays the event's clip if it is on and not throttled. Never throws. */
 async function fire($: $, key: VoiceEvent, opts: { shouldWait?: boolean } = {}): Promise<void> {
@@ -216,7 +228,7 @@ async function fire($: $, key: VoiceEvent, opts: { shouldWait?: boolean } = {}):
     const now = Date.now()
     if (!meta.isImportant && now - lastAt < cfg.gapMs) return
     if (now - (lastByEvent.get(key) ?? 0) < meta.cooldownMs) return
-    const file = pickOne(await clipsFor($, cfg, key))
+    const file = pickOne(await clipsFor($, cfg, key), key)
     if (file === undefined) return
     lastAt = now
     lastByEvent.set(key, now)
@@ -230,19 +242,21 @@ async function fire($: $, key: VoiceEvent, opts: { shouldWait?: boolean } = {}):
 
 // ---------------------------------------------------------------- adding a file
 
-/** Copies the file in as the stage's one voice, replacing the pack's or an earlier one. */
-async function replaceVoice($: $, key: VoiceEvent, raw: string): Promise<boolean> {
-  const src = cleanPath(raw, home)
-  if (src === '') return false
-  const stat = await $.fs.stat(src).catch(() => undefined)
-  if (stat?.kind !== 'file') {
-    await update($, note, () => `找不到文件: ${src}`)
-    return false
-  }
-  if (!AUDIO_EXT.test(src)) {
-    await update($, note, () => `不是支持的音频格式 (wav/ogg/flac/mp3/m4a/aac/opus): ${src}`)
-    return false
-  }
+const isFile = async ($: $, path: string) =>
+  (await $.fs.stat(path).catch(() => undefined))?.kind === 'file'
+
+/** The files a typed or dropped value names: one path as typed, or several dropped at once. */
+async function droppedFiles($: $, raw: string): Promise<string[]> {
+  const whole = cleanPath(raw, home)
+  if (whole === '') return []
+  if (await isFile($, whole)) return [whole]
+  return splitPaths(raw, home).filter(one => one !== '')
+}
+
+/** Copies one file under custom/<stage>/ (converted when the player can't read it); its path, or why not. */
+async function importClip($: $, key: VoiceEvent, src: string, n: number): Promise<{ dest?: string; why?: string }> {
+  if (!(await isFile($, src))) return { why: `找不到文件: ${src}` }
+  if (!AUDIO_EXT.test(src)) return { why: `不是支持的音频格式 (wav/ogg/flac/mp3/m4a/aac/opus): ${src}` }
   const dir = `${configDir()}/custom/${key}`
   await $.process.run(['mkdir', '-p', dir])
   const stem = safeName(baseName(src).replace(AUDIO_EXT, ''))
@@ -250,8 +264,7 @@ async function replaceVoice($: $, key: VoiceEvent, raw: string): Promise<boolean
   await findPlayer($)
   const isCopy = PLAYABLE_EXT.test(src) || playerName === 'afplay'
   const ext = isCopy ? (src.match(AUDIO_EXT)?.[0] ?? '.wav').toLowerCase() : '.wav'
-  const dest = `${dir}/${stem}-${Date.now()}${ext}`
-
+  const dest = `${dir}/${stem}-${Date.now()}${n > 0 ? `-${n}` : ''}${ext}`
   const copied = isCopy
     ? await $.process.run(['cp', src, dest]).catch(() => undefined)
     : await $.process
@@ -260,20 +273,63 @@ async function replaceVoice($: $, key: VoiceEvent, raw: string): Promise<boolean
         })
         .catch(() => undefined)
   if (copied?.exitCode !== 0) {
-    const why = copied?.stderr.trim().split('\n').pop() || (isCopy ? 'cp 失败' : '需要 ffmpeg 转码')
-    await update($, note, () => `替换失败: ${why}`)
+    return { why: copied?.stderr.trim().split('\n').pop() || (isCopy ? 'cp 失败' : '需要 ffmpeg 转码') }
+  }
+  return { dest }
+}
+
+/**
+ * Copies the dropped files in as the stage's voices: `replace` puts them in place of the
+ * pack's or earlier ones, `add` puts them beside the stage's own. Says what happened in the note.
+ */
+async function addVoices($: $, key: VoiceEvent, raw: string, mode: Editing['mode']): Promise<boolean> {
+  const files = await droppedFiles($, raw)
+  if (files.length === 0) return false
+  const added: string[] = []
+  const failed: string[] = []
+  for (const [n, src] of files.entries()) {
+    const got = await importClip($, key, src, n)
+    if (got.dest !== undefined) added.push(got.dest)
+    else failed.push(got.why ?? src)
+  }
+  if (added.length === 0) {
+    await update($, note, () => `没有加进去: ${failed.join('；')}`)
     return false
   }
-
   const old = (await read($, config)).events[key].custom
   const cfg = await saveConfig($, cfg => ({
     ...cfg,
-    events: { ...cfg.events, [key]: { enabled: true, custom: [dest] } },
+    events: {
+      ...cfg.events,
+      [key]: { enabled: true, custom: mode === 'add' ? [...old, ...added] : added },
+    },
   }))
-  await removeOwnCopies($, old)
-  await update($, note, () => `「${META[key].label}」已换成 ${baseName(src)}`)
-  void playFile($, dest, cfg.volume)
+  if (mode === 'replace') await removeOwnCopies($, old)
+  const total = cfg.events[key].custom.length
+  const label = META[key].label
+  const done =
+    mode === 'add'
+      ? `「${label}」加了 ${added.length} 条，现在共 ${total} 条，随机播放`
+      : `「${label}」已换成 ${added.length === 1 ? baseName(files[0] ?? '') : `${added.length} 条`}`
+  await update($, note, () => (failed.length > 0 ? `${done}；跳过: ${failed.join('；')}` : done))
+  void playFile($, added[0] ?? '', cfg.volume)
   return true
+}
+
+/** Takes one clip out of the stage's own list (the stage goes back to the pack when none is left). */
+async function removeVoice($: $, key: VoiceEvent, path: string): Promise<void> {
+  const cfg = await saveConfig($, c => ({
+    ...c,
+    events: {
+      ...c.events,
+      [key]: { ...c.events[key], custom: c.events[key].custom.filter(one => one !== path) },
+    },
+  }))
+  await removeOwnCopies($, [path])
+  const left = cfg.events[key].custom.length
+  await update($, note, () =>
+    left > 0 ? `已删除 ${baseName(path)}，还剩 ${left} 条` : `已删除 ${baseName(path)}，「${META[key].label}」回到语音包默认`,
+  )
 }
 
 /** Deletes the copies this mod made under custom/; files kept elsewhere are left alone. */
@@ -326,7 +382,7 @@ export const register: Register = on => {
         return { text: `用法: /voices test <事件>，事件: ${EVENTS.map(one => one.key).join(', ')}` }
       }
       const cfg = await read($, config)
-      const file = pickOne(await clipsFor($, cfg, arg))
+      const file = pickOne(await clipsFor($, cfg, arg), arg)
       if (file === undefined) return { text: `「${META[arg].label}」没有可播放的语音` }
       await playFile($, file, cfg.volume)
       return { text: `播放了 ${baseName(file)}` }
@@ -432,6 +488,7 @@ export const register: Register = on => {
     const { Box, Text, Button, Input, Select } = $.ui.resolve(e)
     const cfg = await read($, config)
     const open = await read($, editing)
+    const listed = await read($, expanded)
     const message = await read($, note)
     const packs = await listPacks($)
     const online = await read($, catalog)
@@ -449,22 +506,27 @@ export const register: Register = on => {
       change(c => ({ ...c, events: { ...c.events, [key]: fn(c.events[key]) } }))
     const preview = (key: VoiceEvent) => async () => {
       const now = await read($, config)
-      const file = pickOne(await clipsFor($, now, key))
+      const file = pickOne(await clipsFor($, now, key), key)
       if (file === undefined) await update($, note, () => `「${META[key].label}」没有可播放的语音`)
-      else {
-        await update($, note, () => `▶ ${baseName(file)}`)
-        await playFile($, file, now.volume)
-      }
+      else await playOne(file)
     }
-    const startEdit = (key: VoiceEvent) => async () => {
-      await update($, editing, () => key)
+    const playOne = async (file: string) => {
+      await update($, note, () => `▶ ${baseName(file)}`)
+      await playFile($, file, (await read($, config)).volume)
+    }
+    const startEdit = (stage: VoiceEvent, mode: Editing['mode']) => async () => {
+      await update($, editing, () => ({ stage, mode }))
       await update($, note, () => '')
       await $.ui.focus({ requestId: PANE, key: 'file' }).catch(() => undefined)
     }
-    const stopEdit = async (key: VoiceEvent) => {
+    const stopEdit = async (stage: VoiceEvent, mode: Editing['mode']) => {
       await update($, editing, () => null)
-      await $.ui.focus({ requestId: PANE, key: `swap-${key}` }).catch(() => undefined)
+      await $.ui
+        .focus({ requestId: PANE, key: `${mode === 'add' ? 'add' : 'swap'}-${stage}` })
+        .catch(() => undefined)
     }
+    const toggleList = (stage: VoiceEvent) => () =>
+      update($, expanded, now => (now === stage ? null : stage))
     const volume = (delta: number) =>
       change(c => ({ ...c, volume: clamp(Math.round((c.volume + delta) * 10) / 10, 0, 1.5) }))
 
@@ -503,7 +565,7 @@ export const register: Register = on => {
         {!packs.some(one => one.name === cfg.pack) && (
           <Text color="yellow">当前语音包「{cfg.pack}」还没安装，在下面「在线语音包」里下载一个</Text>
         )}
-        <Text dimColor>─ 生命周期 ─ [x] 开关 · ▶ 试听 · 换 替换语音 ─────</Text>
+        <Text dimColor>─ 生命周期 ─ [x] 开关 · ▶ 随机试听 · 换 替换 · 加 追加 · N 条 展开 ─</Text>
         {rows.map(({ meta, setting, clips, isCustom }) => (
           <Box key={`stage-${meta.key}`} flexDirection="column">
             <Box key={`row-${meta.key}`} gap={1}>
@@ -516,7 +578,14 @@ export const register: Register = on => {
                 <Text dimColor={!setting.enabled}>{meta.label}</Text>
               </Box>
               <Button key={`play-${meta.key}`} label="▶" onPress={preview(meta.key)} />
-              <Button key={`swap-${meta.key}`} label="换" onPress={startEdit(meta.key)} />
+              <Button key={`swap-${meta.key}`} label="换" onPress={startEdit(meta.key, 'replace')} />
+              <Button key={`add-${meta.key}`} label="加" onPress={startEdit(meta.key, 'add')} />
+              <Button
+                key={`list-${meta.key}`}
+                dimColor
+                label={`${listed === meta.key ? '▾' : '▸'} ${clips.length} 条`}
+                onPress={toggleList(meta.key)}
+              />
               <Text dimColor>{describe(clips, isCustom)}</Text>
               {isCustom && (
                 <Button
@@ -535,21 +604,47 @@ export const register: Register = on => {
                 />
               )}
             </Box>
-            {open === meta.key && (
+            {listed === meta.key && (
+              <Box key={`clips-${meta.key}`} flexDirection="column" paddingLeft={4}>
+                {clips.length === 0 && <Text dimColor>（这个阶段没有语音）</Text>}
+                {!isCustom && clips.length > 0 && (
+                  <Text dimColor>语音包自带，随机播放；「加」自己的语音后只在自己加的里面随机</Text>
+                )}
+                {clips.map((file, i) => (
+                  <Box key={`clip-${meta.key}-${i}`} gap={1}>
+                    <Button key={`hear-${meta.key}-${i}`} label="▶" onPress={() => playOne(file)} />
+                    <Text>{baseName(file)}</Text>
+                    {isCustom && (
+                      <Button
+                        key={`rm-${meta.key}-${i}`}
+                        dimColor
+                        label="✕"
+                        onPress={() => removeVoice($, meta.key, file)}
+                      />
+                    )}
+                  </Box>
+                ))}
+              </Box>
+            )}
+            {open?.stage === meta.key && (
               <Box key={`edit-${meta.key}`} gap={1} paddingLeft={4}>
                 <Input
                   key="file"
-                  label="新语音 "
-                  placeholder="拖入音频文件或粘贴路径，回车替换"
-                  submitLabel="替换"
+                  label={open.mode === 'add' ? '追加语音 ' : '替换语音 '}
+                  placeholder={
+                    open.mode === 'add'
+                      ? '拖入一个或多个音频文件，回车追加'
+                      : '拖入一个或多个音频文件，回车替换'
+                  }
+                  submitLabel={open.mode === 'add' ? '追加' : '替换'}
                   autoFocus
                   onSubmit={async value => {
-                    if (value.trim() === '' || (await replaceVoice($, meta.key, value))) {
-                      await stopEdit(meta.key)
+                    if (value.trim() === '' || (await addVoices($, meta.key, value, open.mode))) {
+                      await stopEdit(meta.key, open.mode)
                     }
                   }}
                 />
-                <Button key="cancel" dimColor label="取消" onPress={() => stopEdit(meta.key)} />
+                <Button key="cancel" dimColor label="取消" onPress={() => stopEdit(meta.key, open.mode)} />
               </Box>
             )}
           </Box>
